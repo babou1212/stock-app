@@ -80,6 +80,7 @@ def init_db():
             value TEXT NOT NULL
         );
         """,
+        ]
 
     with ENGINE.begin() as conn:
         for q in ddl:
@@ -515,4 +516,5 @@ with tab3:
             use_container_width=True,
 
         )
+
 
