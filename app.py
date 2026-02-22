@@ -271,8 +271,18 @@ def on_article_change():
 
         with c1:
             date_mvt = st.date_input("Date", value=dt.date.today())
-            article = st.text_input("Numéro d'article", placeholder="Ex: 155082").strip()
-            designation = st.text_input("Désignation", placeholder="Ex: Sonde O2").strip()
+article = st.text_input(
+    "Numéro d'article",
+    placeholder="Ex: 155082",
+    key="mvt_article",
+    on_change=on_article_change,
+).strip()
+
+designation = st.text_input(
+    "Désignation",
+    placeholder="Ex: Sonde O2",
+    key="mvt_designation",
+).strip()
 
         with c2:
             emplacement = st.selectbox("Emplacement", ["STOCK"], index=0)
@@ -551,4 +561,5 @@ with tab_addr:
                 st.rerun()
             except Exception as e:
                 st.exception(e)
+
 
