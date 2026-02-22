@@ -317,7 +317,7 @@ if search:
             | df["designation"].astype(str).str.lower().str.contains(search, na=False)
         ].copy()
 else:
-        df_view = df.copy()
+    df_view = df.copy()
 
     st.dataframe(df_view, use_container_width=True, height=360)
 
@@ -923,6 +923,7 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
 
 
