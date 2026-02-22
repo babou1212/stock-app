@@ -688,97 +688,43 @@ with tab_mvt:
                 except Exception as e:
                     st.exception(e)
 
-# ---------------------------------
-# TAB 2 : STOCK ACTUEL (stock + pièces à commander + historique + suppression)
-# ---------------------------------
-with tab_stock:
-    st.subheader("Stock actuel")
-
-    # seuil global (si seuil_piece vide)
-    default_seuil = int(get_setting("seuil_commande", "3"))
-    seuil_global = st.number_input("Seuil global (utilisé si 'seuil pièce' = 0)", min_value=0, max_value=100000, value=default_seuil, step=1)
-    if int(seuil_global) != default_seuil:
-        set_setting("seuil_commande", str(int(seuil_global)))
-
-    search = st.text_input("Recherche", placeholder="Numéro ou mot dans désignation...").strip().lower()
-
-    df = read_df("""
-        SELECT article, designation, stock, garantie, COALESCE(seuil_piece, 0) AS seuil_piece
-        FROM articles
-        ORDER BY article
-    """)
-
-    if search:
-        df_view = df[
-            df["article"].astype(str).str.lower().str.contains(search, na=False)
-            | df["designation"].astype(str).str.lower().str.contains(search, na=False)
-        ].copy()
-    else:
-        df_view = df.copy()
-
-    st.dataframe(df_view, use_container_width=True, height=360)
-
-    st.divider()
-
-    # Pièces à commander
-    st.subheader("📦 Pièces à commander")
-
-    # seuil utilisé : seuil_piece si >0 sinon seuil_global
-    if not df.empty:
-        df2 = df.copy()
-        df2["seuil_utilise"] = df2["seuil_piece"].apply(lambda x: int(x) if int(x) > 0 else int(seuil_global))
-        a_commander = df2[df2["stock"] <= df2["seuil_utilise"]].copy()
-        a_commander = a_commander.sort_values(["stock", "designation", "article"])
-        if a_commander.empty:
-            st.success("Rien à commander ✅")
-        else:
-            st.dataframe(
-                a_commander[["article", "designation", "stock", "seuil_piece", "seuil_utilise"]],
-                use_container_width=True,
-                height=320
-            )
-    else:
-        st.info("Aucun article en base.")
-
-    st.divider()
-
-    # Historique (ici, dans Stock actuel)
-    st.subheader("Historique (300 derniers)")
-
-    hist = read_df("""
-        SELECT id, date_mvt, article, designation, type_mvt, emplacement, quantite,
-               COALESCE(adresse,'') AS adresse,
-               COALESCE(commentaire,'') AS commentaire
-        FROM mouvements
-        ORDER BY id DESC
-        LIMIT 300
-    """)
-
-    if hist.empty:
-        st.info("Aucun mouvement pour l’instant.")
-    else:
-        st.dataframe(hist, use_container_width=True, height=420)
-
-    st.divider()
-
-    # Supprimer un article (en bas dans Stock actuel)
     st.subheader("🗑️ Supprimer un article (tout en bas)")
+    st.warning("⚠️ Supprime aussi les mouvements liés à cet article.")
 
-    articles_df2 = read_df("SELECT article FROM articles ORDER BY article")
-    articles_list2 = articles_df2["article"].astype(str).tolist()
+    articles_df = read_df("SELECT article FROM articles ORDER BY article")
+    articles_list = articles_df["article"].astype(str).tolist()
 
-    if len(articles_list2) == 0:
-        st.info("Aucun article à supprimer.")
+    if len(articles_list) > 0:
+
+        del_article = st.selectbox(
+            "Article à supprimer",
+            articles_list,
+            key="del_article"
+        )
+
+        confirm = st.checkbox(
+            "Je confirme la suppression définitive",
+            value=False
+        )
+
+        if st.button(
+            "❌ Supprimer définitivement",
+            use_container_width=True,
+            disabled=not confirm
+        ):
+            exec_sql(
+                "DELETE FROM mouvements WHERE article=:a",
+                {"a": del_article}
+            )
+            exec_sql(
+                "DELETE FROM articles WHERE article=:a",
+                {"a": del_article}
+            )
+            st.success("✅ Article supprimé.")
+            st.rerun()
+
     else:
-        a_del = st.selectbox("Choisir l'article à supprimer", articles_list2)
-        confirm = st.checkbox("Je confirme la suppression (irréversible)", value=False)
-        if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
-            try:
-                delete_article(a_del)
-                st.success("Article supprimé ✅")
-                st.rerun()
-            except Exception as e:
-                st.exception(e)
+        st.info("Aucun article à supprimer.")
 
 # ---------------------------------
 # TAB 3 : ADRESSES
@@ -977,6 +923,7 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
 
 
