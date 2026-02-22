@@ -74,7 +74,12 @@ def init_db():
             commentaire TEXT
         );
         """,
-    ]
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """,
 
     with ENGINE.begin() as conn:
         for q in ddl:
@@ -90,6 +95,21 @@ def exec_sql(query: str, params: dict | None = None):
     with ENGINE.begin() as conn:
         conn.execute(text(query), params or {})
 
+
+def get_setting(key: str, default: str) -> str:
+    df = read_df("SELECT value FROM settings WHERE key = :k", {"k": key})
+    return df.iloc[0]["value"] if not df.empty else default
+
+
+def set_setting(key: str, value: str):
+    exec_sql(
+        """
+        INSERT INTO settings(key, value)
+        VALUES (:k, :v)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        {"k": key, "v": value},
+    )
 
 # -------------------------
 # Data access
@@ -412,8 +432,21 @@ with tab2:
         colA, colB = st.columns(2)
 
         with colA:
-            st.subheader(f"🛒 Pièces à commander (stock ≤ {SEUIL_COMMANDE})")
-            a_commander = df[df["stock"] <= SEUIL_COMMANDE].copy().sort_values(["stock", "designation", "article"])
+           # ✅ Seuil modifiable (synchro car stocké en DB)
+seuil_db = int(get_setting("seuil_commande", "3"))
+
+seuil_commande = st.number_input(
+    "Seuil pour 'Pièces à commander' (stock ≤ seuil)",
+    min_value=0,
+    max_value=10_000,
+    value=seuil_db,
+    step=1
+)
+
+if int(seuil_commande) != seuil_db:
+    set_setting("seuil_commande", str(int(seuil_commande)))
+            st.subheader(f"🛒 Pièces à commander (stock ≤ {int(seuil_commande)})")
+            a_commander = df[df["stock"] <= int(seuil_commande)].copy()sort_values(["stock", "designation", "article"])
             if a_commander.empty:
                 st.success("Rien à commander ✅")
             else:
@@ -482,3 +515,4 @@ with tab3:
             use_container_width=True,
 
         )
+
