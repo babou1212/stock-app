@@ -238,53 +238,88 @@ st.title("📦 Gestion de stock")
 tab_mvt, tab_stock, tab_addr = st.tabs(["➕ Mouvement", "📦 Stock actuel", "📍 Adresses"])
 
 
-# =========================
-# TAB 1 : MOUVEMENT
-# =========================
-with tab_mvt:
-    st.subheader("Ajouter un mouvement")
+# ==========================================================
+# TAB 1 : MOUVEMENT (AJOUT + MODIFIER ARTICLE)
+#  - Auto-remplissage désignation si article déjà existant
+# ==========================================================
 
-    # Liste adresses
-    addr_df = read_df("SELECT nom FROM adresses ORDER BY nom")
-    addr_list = [""] + addr_df["nom"].tolist()
-
-    def get_designation_for_article(article: str) -> str:
+def get_article_info(article: str) -> dict:
+    """Retourne {'designation': str, 'seuil_piece': int} ou valeurs par défaut."""
+    article = (article or "").strip()
     if not article:
-        return ""
+        return {"designation": "", "seuil_piece": 0}
+
     df = read_df(
-        "SELECT designation FROM articles WHERE article=:a",
+        """
+        SELECT designation, COALESCE(seuil_piece,0) AS seuil_piece
+        FROM articles
+        WHERE article = :a
+        """,
         {"a": article},
         bust=st.session_state.get("_cache_bust", 0),
     )
-    if df.empty:
-        return ""
-    return str(df.iloc[0]["designation"] or "")
 
-def on_article_change():
+    if df.empty:
+        return {"designation": "", "seuil_piece": 0}
+
+    return {
+        "designation": str(df.iloc[0]["designation"] or ""),
+        "seuil_piece": int(df.iloc[0]["seuil_piece"] or 0),
+    }
+
+
+def on_mvt_article_change():
+    """
+    Déclenché quand l'article change :
+    - si la désignation est vide, on auto-remplit depuis la DB
+    - si seuil_piece est encore à 0 (ou vide), on auto-remplit aussi
+    """
     a = (st.session_state.get("mvt_article") or "").strip()
-    # si l'utilisateur n'a rien tapé en désignation, on auto-remplit depuis la DB
-    if a and not (st.session_state.get("mvt_designation") or "").strip():
-        st.session_state["mvt_designation"] = get_designation_for_article(a)
+    if not a:
+        return
+
+    info = get_article_info(a)
+
+    # Auto-remplit désignation seulement si l'utilisateur n'a rien tapé
+    if not (st.session_state.get("mvt_designation") or "").strip():
+        st.session_state["mvt_designation"] = info["designation"]
+
+    # Auto-remplit seuil_piece seulement si champ "vide/0"
+    try:
+        current_seuil = int(st.session_state.get("mvt_seuil_piece") or 0)
+    except Exception:
+        current_seuil = 0
+    if current_seuil == 0 and info["seuil_piece"] > 0:
+        st.session_state["mvt_seuil_piece"] = int(info["seuil_piece"])
+
+
+with tab_mvt:
+    st.subheader("Ajouter un mouvement")
+
+    # Charge adresses (optionnel)
+    addr_df = read_df("SELECT nom FROM adresses ORDER BY nom", bust=st.session_state.get("_cache_bust", 0))
+    addr_list = [""] + (addr_df["nom"].astype(str).tolist() if not addr_df.empty else [])
 
     with st.form("form_mvt", clear_on_submit=False):
-        c1, c2, c3 = st.columns([1.1, 1.1, 1.8])
+        col1, col2, col3 = st.columns([1.1, 1.1, 1.8])
 
-        with c1:
+        with col1:
             date_mvt = st.date_input("Date", value=dt.date.today())
-article = st.text_input(
-    "Numéro d'article",
-    placeholder="Ex: 155082",
-    key="mvt_article",
-    on_change=on_article_change,
-).strip()
 
-designation = st.text_input(
-    "Désignation",
-    placeholder="Ex: Sonde O2",
-    key="mvt_designation",
-).strip()
+            article = st.text_input(
+                "Numéro d'article",
+                placeholder="Ex: 155082",
+                key="mvt_article",
+                on_change=on_mvt_article_change,
+            ).strip()
 
-        with c2:
+            designation = st.text_input(
+                "Désignation",
+                placeholder="Ex: Sonde O2",
+                key="mvt_designation",
+            ).strip()
+
+        with col2:
             emplacement = st.selectbox("Emplacement", ["STOCK"], index=0)
             type_mvt = st.selectbox("Type", ["ENTREE", "SORTIE"], index=0)
             quantite = st.number_input("Quantité", min_value=1, max_value=10_000, value=1, step=1)
@@ -294,111 +329,138 @@ designation = st.text_input(
                 "Seuil pièce (optionnel)",
                 min_value=0,
                 max_value=10_000,
-                value=0,
+                value=int(st.session_state.get("mvt_seuil_piece", 0) or 0),
                 step=1,
+                key="mvt_seuil_piece",
             )
-            maj_seuil = st.checkbox("Mettre à jour le seuil de cette pièce (même si elle existe déjà)", value=True)
 
-        with c3:
+            maj_seuil = st.checkbox(
+                "Mettre à jour le seuil de cette pièce (même si elle existe déjà)",
+                value=True,
+            )
+
+        with col3:
             commentaire = st.text_area("Remarque / commentaire (optionnel)", height=120)
             adresse = st.selectbox("Adresse (optionnel)", addr_list, index=0)
 
-        submitted = st.form_submit_button("✅ Enregistrer", use_container_width=True)
+            submitted = st.form_submit_button("✅ Enregistrer", use_container_width=True)
+
+    # Sécurise l'auto-remplissage même si l'utilisateur clique direct sans perdre le focus
+    if submitted and article and not designation:
+        info = get_article_info(article)
+        if info["designation"]:
+            st.session_state["mvt_designation"] = info["designation"]
+            designation = info["designation"]
 
     if submitted:
         if not article:
             st.error("❌ Numéro d'article obligatoire.")
         else:
-            try:
-                # crée ou maj article (désignation si donnée)
-                upsert_article_min(article, designation)
+            # Si nouvel article (pas en DB) et designation vide => erreur
+            info = get_article_info(article)
+            is_new = (info["designation"] == "")
 
-                # maj seuil si demandé
-                if maj_seuil:
+            if is_new and not designation:
+                st.error("❌ Désignation obligatoire pour un nouvel article.")
+            else:
+                # 1) Crée / met à jour l'article si besoin
+                # - si designation vide => on garde celle en DB (cas article existant)
+                # - si designation renseignée => on la met à jour
+                if designation:
                     exec_sql(
                         """
-                        INSERT INTO articles(article, designation, stock, seuil_piece, garantie)
-                        VALUES(:a, '', 0, :s, 0)
-                        ON CONFLICT (article) DO UPDATE SET seuil_piece = EXCLUDED.seuil_piece
+                        INSERT INTO articles(article, designation, stock, seuil_piece)
+                        VALUES (:a, :d, 0, :s)
+                        ON CONFLICT (article) DO UPDATE
+                        SET designation = EXCLUDED.designation
+                        """,
+                        {"a": article, "d": designation, "s": int(seuil_piece)},
+                    )
+                else:
+                    # article existant, pas de nouvelle désignation -> on s'assure qu'il existe au moins
+                    exec_sql(
+                        """
+                        INSERT INTO articles(article, designation, stock, seuil_piece)
+                        VALUES (:a, '', 0, :s)
+                        ON CONFLICT (article) DO NOTHING
                         """,
                         {"a": article, "s": int(seuil_piece)},
                     )
 
-                # applique mouvement + log
-                apply_movement(article, type_mvt, int(quantite))
+                # 2) Mise à jour du seuil même si l'article existe déjà (si coché)
+                if maj_seuil:
+                    exec_sql(
+                        "UPDATE articles SET seuil_piece = :s WHERE article = :a",
+                        {"a": article, "s": int(seuil_piece)},
+                    )
 
-                # Pour le log, si désignation vide -> récupère en DB
-                if not designation:
-                    ddf = read_df("SELECT designation FROM articles WHERE article=:a", {"a": article})
-                    designation_log = ddf.iloc[0]["designation"] if not ddf.empty else ""
-                else:
-                    designation_log = designation
+                # 3) Appliquer mouvement sur le stock
+                apply_movement(article, type_mvt, int(quantite), emplacement=emplacement)
 
+                # 4) Log mouvement
                 insert_movement(
                     date_mvt=date_mvt,
                     article=article,
-                    designation=designation_log,
+                    designation=(designation or info["designation"] or ""),
                     type_mvt=type_mvt,
                     emplacement=emplacement,
                     quantite=int(quantite),
-                    adresse=adresse,
-                    commentaire=commentaire,
+                    adresse=(adresse or None),
+                    commentaire=(commentaire or None),
                 )
 
                 cache_bust()
                 st.success("✅ Mouvement enregistré.")
-            except Exception as e:
-                st.exception(e)
+                st.rerun()
 
     st.divider()
+    st.subheader("Modifier un article (désignation / seuil pièce)")
 
-    st.subheader("Modifier un article (désignation / seuil pièce / garantie)")
     articles_df = read_df(
         """
-        SELECT article, designation, COALESCE(seuil_piece,0) AS seuil_piece, COALESCE(garantie,0) AS garantie
+        SELECT article, designation, COALESCE(seuil_piece,0) AS seuil_piece
         FROM articles
         ORDER BY article
-        """
+        """,
+        bust=st.session_state.get("_cache_bust", 0),
     )
-    articles_list = articles_df["article"].astype(str).tolist()
 
-    if not articles_list:
+    if articles_df.empty:
         st.info("Aucun article à modifier.")
     else:
-        colA, colB = st.columns([1.2, 1.8])
+        articles_list = articles_df["article"].astype(str).tolist()
+        cA, cB = st.columns([1.1, 1.6])
 
-        with colA:
+        with cA:
             art_sel = st.selectbox("Choisir l'article", articles_list, key="edit_article_sel")
             row = articles_df[articles_df["article"].astype(str) == str(art_sel)].iloc[0]
 
-        with colB:
+        with cB:
             with st.form("form_edit_article"):
                 new_design = st.text_input("Désignation", value=str(row["designation"] or ""))
                 new_seuil = st.number_input(
                     "Seuil pièce (0 = pas de seuil perso)",
                     min_value=0,
                     max_value=10_000,
-                    value=int(row["seuil_piece"]),
-                    step=1,
-                )
-                new_gar = st.number_input(
-                    "Garantie (nombre)",
-                    min_value=0,
-                    max_value=10_000,
-                    value=int(row["garantie"]),
+                    value=int(row["seuil_piece"] or 0),
                     step=1,
                 )
                 save_edit = st.form_submit_button("💾 Enregistrer la modification", use_container_width=True)
 
             if save_edit:
-                try:
-                    update_article_fields(str(art_sel), new_design.strip(), int(new_seuil), int(new_gar))
-                    cache_bust()
-                    st.success("✅ Article modifié.")
-                except Exception as e:
-                    st.exception(e)
-
-
+                exec_sql(
+                    """
+                    UPDATE articles
+                    SET designation = :d,
+                        seuil_piece  = :s
+                    WHERE article = :a
+                    """,
+                    {"a": str(art_sel), "d": new_design.strip(), "s": int(new_seuil)},
+                )
+                cache_bust()
+                st.success("✅ Article modifié.")
+                st.rerun()
+                
 # =========================
 # TAB 2 : STOCK ACTUEL
 # =========================
@@ -561,5 +623,6 @@ with tab_addr:
                 st.rerun()
             except Exception as e:
                 st.exception(e)
+
 
 
