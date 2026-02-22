@@ -1,98 +1,61 @@
+# app.py
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
+from typing import Optional
+
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# -----------------------------
-# PAGE
-# -----------------------------
-st.set_page_config(page_title="Gestion de stock", layout="wide")
-st.title("📦 Gestion de stock")
+# =========================
+# CONFIG
+# =========================
+st.set_page_config(page_title="Gestion de stock", page_icon="📦", layout="wide")
 
 DEFAULT_SEUIL_GLOBAL = 3
-EMPLACEMENTS = ["STOCK", "CHANTIER", "DEPOT"]
-TYPES = ["ENTREE", "SORTIE"]
+HIST_LIMIT = 300
 
-# -----------------------------
+# =========================
 # DB
-# -----------------------------
-@st.cache_resource
+# =========================
 def get_engine() -> Engine:
-    db_url = str(st.secrets.get("DB_URL", "")).strip()
+    db_url = st.secrets.get("DB_URL", "").strip()
     if not db_url:
-        st.error("DB_URL manquant. Streamlit → Settings → Secrets.")
+        st.error("❌ DB_URL manquant dans Secrets (Streamlit).")
         st.stop()
 
-    return create_engine(
-        db_url,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        pool_size=5,
-        max_overflow=5,
-    )
+    # pool_pre_ping évite les connexions mortes, pool_recycle évite les timeouts long
+    return create_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
+
 
 ENGINE = get_engine()
 
 
-def exec_sql(sql: str, params: dict | None = None) -> None:
+def exec_sql(sql: str, params: Optional[dict] = None) -> None:
     params = params or {}
     with ENGINE.begin() as conn:
         conn.execute(text(sql), params)
-    st.cache_data.clear()
 
 
-@st.cache_data(ttl=10)
-def read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+@st.cache_data(ttl=10, show_spinner=False)
+def read_df(sql: str, params: Optional[dict] = None) -> pd.DataFrame:
     params = params or {}
     with ENGINE.begin() as conn:
         return pd.read_sql(text(sql), conn, params=params)
 
 
+def cache_bust() -> None:
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
 def init_db() -> None:
-    # Articles
-    exec_sql(
-        """
-        CREATE TABLE IF NOT EXISTS articles (
-            article TEXT PRIMARY KEY,
-            designation TEXT NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            garantie INTEGER NOT NULL DEFAULT 0,
-            seuil_piece INTEGER NULL
-        );
-        """
-    )
-
-    # Mouvements (on garde le nom date_mvt pour éviter erreurs si tu avais déjà un ancien schéma)
-    exec_sql(
-        """
-        CREATE TABLE IF NOT EXISTS mouvements (
-            id BIGSERIAL PRIMARY KEY,
-            date_mvt DATE NOT NULL,
-            article TEXT NOT NULL,
-            designation TEXT NOT NULL,
-            type_mvt TEXT NOT NULL,
-            emplacement TEXT NOT NULL,
-            quantite INTEGER NOT NULL,
-            commentaire TEXT NULL,
-            adresse TEXT NULL
-        );
-        """
-    )
-
-    # Adresses
-    exec_sql(
-        """
-        CREATE TABLE IF NOT EXISTS adresses (
-            id BIGSERIAL PRIMARY KEY,
-            nom TEXT UNIQUE NOT NULL
-        );
-        """
-    )
-
-    # Settings
+    # Tables principales
     exec_sql(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -102,202 +65,341 @@ def init_db() -> None:
         """
     )
 
-    # Colonnes si base ancienne
-    exec_sql("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seuil_piece INTEGER;")
-    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS adresse TEXT;")
-    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS commentaire TEXT;")
-    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS date_mvt DATE;")
+    exec_sql(
+        """
+        CREATE TABLE IF NOT EXISTS articles (
+            article TEXT PRIMARY KEY,
+            designation TEXT NOT NULL DEFAULT '',
+            stock INTEGER NOT NULL DEFAULT 0,
+            garantie INTEGER NOT NULL DEFAULT 0,
+            seuil_piece INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
 
-    # Index (rapidité)
-    exec_sql("CREATE INDEX IF NOT EXISTS idx_articles_stock ON articles(stock);")
-    exec_sql("CREATE INDEX IF NOT EXISTS idx_mouvements_article ON mouvements(article);")
-    exec_sql("CREATE INDEX IF NOT EXISTS idx_mouvements_date ON mouvements(date_mvt);")
+    exec_sql(
+        """
+        CREATE TABLE IF NOT EXISTS adresses (
+            id SERIAL PRIMARY KEY,
+            nom TEXT UNIQUE NOT NULL
+        );
+        """
+    )
 
-    # Seuil global par défaut
-    df = read_df("SELECT value FROM settings WHERE key='seuil_global'")
-    if df.empty:
-        exec_sql(
-            "INSERT INTO settings(key,value) VALUES('seuil_global', :v)",
-            {"v": str(DEFAULT_SEUIL_GLOBAL)},
-        )
+    exec_sql(
+        """
+        CREATE TABLE IF NOT EXISTS mouvements (
+            id BIGSERIAL PRIMARY KEY,
+            date_mvt DATE NOT NULL,
+            article TEXT NOT NULL,
+            designation TEXT NOT NULL DEFAULT '',
+            type_mvt TEXT NOT NULL,
+            emplacement TEXT NOT NULL DEFAULT 'STOCK',
+            quantite INTEGER NOT NULL,
+            adresse TEXT NOT NULL DEFAULT '',
+            commentaire TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+
+    # “Migrations” souples (si tu avais une DB déjà existante)
+    for ddl in [
+        "ALTER TABLE articles ADD COLUMN IF NOT EXISTS garantie INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE articles ADD COLUMN IF NOT EXISTS seuil_piece INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS adresse TEXT NOT NULL DEFAULT '';",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS commentaire TEXT NOT NULL DEFAULT '';",
+    ]:
+        try:
+            exec_sql(ddl)
+        except Exception:
+            # si une DB refuse un IF NOT EXISTS selon config, on ignore
+            pass
+
+    # Index (optionnel, améliore les perfs)
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_mouvements_article ON mouvements(article);",
+        "CREATE INDEX IF NOT EXISTS idx_mouvements_date ON mouvements(date_mvt);",
+    ]:
+        try:
+            exec_sql(idx)
+        except Exception:
+            pass
+
+    # Valeur par défaut du seuil global si absent
+    if get_setting_int("seuil_global", DEFAULT_SEUIL_GLOBAL) is None:
+        set_setting("seuil_global", str(DEFAULT_SEUIL_GLOBAL))
 
 
 def get_setting(key: str, default: str) -> str:
     df = read_df("SELECT value FROM settings WHERE key=:k", {"k": key})
-    return default if df.empty else str(df.iloc[0]["value"])
+    if df.empty:
+        return default
+    return str(df.iloc[0]["value"])
+
+
+def get_setting_int(key: str, default: int) -> Optional[int]:
+    try:
+        val = get_setting(key, str(default))
+        return int(val)
+    except Exception:
+        return default
 
 
 def set_setting(key: str, value: str) -> None:
     exec_sql(
         """
-        INSERT INTO settings(key,value)
-        VALUES(:k,:v)
-        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+        INSERT INTO settings(key, value)
+        VALUES (:k, :v)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
         """,
-        {"k": key, "v": str(value)},
+        {"k": key, "v": value},
     )
 
 
-init_db()
+# =========================
+# LOGIQUE METIER
+# =========================
+@dataclass
+class ArticleEdit:
+    article: str
+    designation: str
+    garantie: int
+    seuil_piece: int
 
-# -----------------------------
-# HELPERS
-# -----------------------------
-def upsert_article(article: str, designation: str, seuil_piece: int | None) -> None:
+
+def upsert_article(article: str, designation: str, garantie: int = 0, seuil_piece: int = 0) -> None:
     exec_sql(
         """
-        INSERT INTO articles(article, designation, seuil_piece)
-        VALUES(:a,:d,:sp)
-        ON CONFLICT(article) DO UPDATE
-        SET designation = EXCLUDED.designation,
-            seuil_piece = COALESCE(EXCLUDED.seuil_piece, articles.seuil_piece)
+        INSERT INTO articles(article, designation, stock, garantie, seuil_piece)
+        VALUES (:a, :d, 0, :g, :s)
+        ON CONFLICT (article) DO UPDATE SET
+            designation = EXCLUDED.designation,
+            garantie = EXCLUDED.garantie,
+            seuil_piece = EXCLUDED.seuil_piece;
         """,
-        {"a": article, "d": designation, "sp": seuil_piece},
+        {"a": article, "d": designation, "g": int(garantie), "s": int(seuil_piece)},
     )
 
 
-def set_seuil_piece(article: str, seuil_piece: int | None) -> None:
+def update_article_fields(edit: ArticleEdit) -> None:
     exec_sql(
-        "UPDATE articles SET seuil_piece=:sp WHERE article=:a",
-        {"sp": seuil_piece, "a": article},
+        """
+        UPDATE articles
+        SET designation = :d,
+            garantie = :g,
+            seuil_piece = :s
+        WHERE article = :a;
+        """,
+        {"a": edit.article, "d": edit.designation, "g": int(edit.garantie), "s": int(edit.seuil_piece)},
     )
 
 
-def set_stock(article: str, new_stock: int) -> None:
+def apply_movement(article: str, designation: str, type_mvt: str, quantite: int) -> None:
+    # Met à jour le stock dans articles
+    delta = int(quantite)
+    if type_mvt.upper() == "SORTIE":
+        delta = -abs(delta)
+    else:
+        delta = abs(delta)
+
     exec_sql(
-        "UPDATE articles SET stock=:s WHERE article=:a",
-        {"s": int(new_stock), "a": article},
+        """
+        INSERT INTO articles(article, designation, stock, garantie, seuil_piece)
+        VALUES (:a, :d, 0, 0, 0)
+        ON CONFLICT (article) DO UPDATE SET
+            designation = CASE
+                WHEN EXCLUDED.designation <> '' THEN EXCLUDED.designation
+                ELSE articles.designation
+            END;
+        """,
+        {"a": article, "d": designation},
     )
 
-
-def apply_movement(article: str, qty: int, type_mvt: str) -> None:
-    delta = int(qty) if type_mvt == "ENTREE" else -int(qty)
     exec_sql(
-        "UPDATE articles SET stock = GREATEST(stock + :d, 0) WHERE article=:a",
-        {"d": delta, "a": article},
+        """
+        UPDATE articles
+        SET stock = stock + :delta
+        WHERE article = :a;
+        """,
+        {"a": article, "delta": int(delta)},
     )
 
 
-def add_mouvement(
+def insert_movement(
     date_mvt: dt.date,
     article: str,
     designation: str,
     type_mvt: str,
     emplacement: str,
     quantite: int,
-    commentaire: str | None,
-    adresse: str | None,
+    adresse: str,
+    commentaire: str,
 ) -> None:
     exec_sql(
         """
-        INSERT INTO mouvements(date_mvt, article, designation, type_mvt, emplacement, quantite, commentaire, adresse)
-        VALUES(:dt,:a,:d,:t,:e,:q,:c,:adr)
+        INSERT INTO mouvements(date_mvt, article, designation, type_mvt, emplacement, quantite, adresse, commentaire)
+        VALUES (:date_mvt, :article, :designation, :type_mvt, :emplacement, :quantite, :adresse, :commentaire);
         """,
         {
-            "dt": date_mvt,
-            "a": article,
-            "d": designation,
-            "t": type_mvt,
-            "e": emplacement,
-            "q": int(quantite),
-            "c": commentaire if commentaire else None,
-            "adr": adresse if adresse else None,
+            "date_mvt": date_mvt,
+            "article": article,
+            "designation": designation,
+            "type_mvt": type_mvt,
+            "emplacement": emplacement,
+            "quantite": int(quantite),
+            "adresse": adresse or "",
+            "commentaire": commentaire or "",
         },
     )
 
 
-# -----------------------------
-# UI TABS
-# -----------------------------
+def delete_article(article: str) -> None:
+    # Supprime aussi les mouvements liés
+    exec_sql("DELETE FROM mouvements WHERE article = :a", {"a": article})
+    exec_sql("DELETE FROM articles WHERE article = :a", {"a": article})
+
+
+# =========================
+# UI
+# =========================
+init_db()
+
+st.title("📦 Gestion de stock")
+
 tab_mvt, tab_stock, tab_addr = st.tabs(["➕ Mouvement", "📦 Stock actuel", "📍 Adresses"])
 
-# ==========================================================
-# TAB 1 : MOUVEMENT
-# ==========================================================
+
+# -------------------------
+# TAB 1 : MOUVEMENT + MODIF ARTICLE
+# -------------------------
 with tab_mvt:
     st.subheader("Ajouter un mouvement")
 
-    # Charger adresses
-    adf = read_df("SELECT nom FROM adresses ORDER BY nom")
-    addr_list = adf["nom"].tolist()
+    # Charge adresses
+    addr_df = read_df("SELECT nom FROM adresses ORDER BY nom")
+    addr_list = [""] + addr_df["nom"].tolist()
 
-    col1, col2, col3 = st.columns(3)
+    with st.form("form_mvt", clear_on_submit=False):
+        col1, col2, col3 = st.columns([1.1, 1.1, 1.8])
 
-    with col1:
-        date_mvt = st.date_input("Date", value=dt.date.today())
-        article = st.text_input("Numéro d'article", placeholder="Ex: 155082").strip()
+        with col1:
+            date_mvt = st.date_input("Date", value=dt.date.today())
+            article = st.text_input("Numéro d'article", placeholder="Ex: 155082").strip()
+            designation = st.text_input("Désignation", placeholder="Ex: Sonde O2").strip()
 
-        designation_auto = ""
-        seuil_auto = 0
+        with col2:
+            emplacement = st.selectbox("Emplacement", ["STOCK"], index=0)
+            type_mvt = st.selectbox("Type", ["ENTREE", "SORTIE"], index=0)
+            quantite = st.number_input("Quantité", min_value=1, max_value=10_000, value=1, step=1)
 
-        if article:
-            ex = read_df(
-                "SELECT designation, COALESCE(seuil_piece,0) AS sp FROM articles WHERE article=:a",
-                {"a": article},
+            st.caption("Seuil pièce : 0 = aucun (seuil global utilisé)")
+            seuil_piece = st.number_input(
+                "Seuil pièce (optionnel)",
+                min_value=0,
+                max_value=10_000,
+                value=0,
+                step=1,
             )
-            if not ex.empty:
-                designation_auto = str(ex.iloc[0]["designation"])
-                seuil_auto = int(ex.iloc[0]["sp"])
+            maj_seuil = st.checkbox("Mettre à jour le seuil de cette pièce (même si elle existe déjà)", value=True)
 
-        designation = st.text_input("Désignation", value=designation_auto, placeholder="Ex: Sonde O2").strip()
+        with col3:
+            commentaire = st.text_area("Remarque / commentaire (optionnel)", height=120)
+            adresse = st.selectbox("Adresse (optionnel)", addr_list, index=0)
 
-        seuil_piece = st.number_input(
-            "Seuil pièce (0 = aucun, sinon seuil personnalisé)",
-            min_value=0,
-            value=int(seuil_auto),
-            step=1,
-            help="Tu peux définir un seuil spécifique pour cette pièce.",
-        )
+            submitted = st.form_submit_button("✅ Enregistrer", use_container_width=True)
 
-        maj_seuil_existant = st.checkbox(
-            "Mettre à jour le seuil de cette pièce (même si elle existe déjà)",
-            value=True,
-        )
+    if submitted:
+        if not article:
+            st.error("❌ Numéro d'article obligatoire.")
+        else:
+            # crée/maj article (désignation + éventuellement seuil)
+            if maj_seuil:
+                # Si designation vide, on garde ce qu’on a en DB si existe
+                if designation:
+                    upsert_article(article, designation, garantie=0, seuil_piece=int(seuil_piece))
+                else:
+                    # si designation vide, on met juste le seuil
+                    exec_sql(
+                        """
+                        INSERT INTO articles(article, designation, stock, garantie, seuil_piece)
+                        VALUES (:a, '', 0, 0, :s)
+                        ON CONFLICT (article) DO UPDATE SET seuil_piece = :s;
+                        """,
+                        {"a": article, "s": int(seuil_piece)},
+                    )
+            else:
+                if designation:
+                    upsert_article(article, designation, garantie=0, seuil_piece=0)
 
-    with col2:
-        emplacement = st.selectbox("Emplacement", EMPLACEMENTS, index=0)
-        type_mvt = st.selectbox("Type", TYPES, index=0)
-        quantite = st.number_input("Quantité", min_value=1, value=1, step=1)
-
-        adresse = st.selectbox("Adresse (optionnel)", [""] + addr_list, index=0)
-
-    with col3:
-        commentaire = st.text_area("Remarque / commentaire (optionnel)", height=120)
-        if st.button("✅ Enregistrer", use_container_width=True):
-            if not article:
-                st.error("Numéro d'article obligatoire.")
-                st.stop()
-            if not designation:
-                st.error("Désignation obligatoire.")
-                st.stop()
-
-            # Upsert article (désignation)
-            sp_to_store = None if int(seuil_piece) == 0 else int(seuil_piece)
-            upsert_article(article, designation, sp_to_store if maj_seuil_existant else None)
-
-            # Stock
-            apply_movement(article, int(quantite), type_mvt)
-
-            # Historique
-            add_mouvement(
+            # applique mouvement + log mouvement
+            apply_movement(article, designation, type_mvt, int(quantite))
+            insert_movement(
                 date_mvt=date_mvt,
                 article=article,
                 designation=designation,
                 type_mvt=type_mvt,
                 emplacement=emplacement,
                 quantite=int(quantite),
-                commentaire=commentaire.strip() if commentaire else None,
-                adresse=adresse.strip() if adresse else None,
+                adresse=adresse,
+                commentaire=commentaire,
             )
 
-            st.success("✅ Mouvement enregistré !")
+            cache_bust()
+            st.success("✅ Mouvement enregistré.")
+            st.rerun()
 
     st.divider()
-  
 
-# ==========================================================
-# TAB 2 : STOCK ACTUEL
-# ==========================================================
+    st.subheader("Modifier un article (désignation / garantie / seuil pièce)")
+
+    articles_df = read_df(
+        """
+        SELECT article, designation, garantie, COALESCE(seuil_piece,0) AS seuil_piece
+        FROM articles
+        ORDER BY article
+        """
+    )
+    articles_list = articles_df["article"].astype(str).tolist()
+
+    if not articles_list:
+        st.info("Aucun article à modifier.")
+    else:
+        colA, colB = st.columns([1.2, 1.8])
+
+        with colA:
+            art_sel = st.selectbox("Choisir l'article", articles_list, key="edit_article_sel")
+            row = articles_df[articles_df["article"].astype(str) == str(art_sel)].iloc[0]
+
+        with colB:
+            with st.form("form_edit_article"):
+                new_design = st.text_input("Désignation", value=str(row["designation"] or ""))
+                new_gar = st.number_input("Garantie", min_value=0, max_value=10_000, value=int(row["garantie"]), step=1)
+                new_seuil = st.number_input(
+                    "Seuil pièce (0 = pas de seuil perso)",
+                    min_value=0,
+                    max_value=10_000,
+                    value=int(row["seuil_piece"]),
+                    step=1,
+                )
+                save_edit = st.form_submit_button("💾 Enregistrer la modification", use_container_width=True)
+
+            if save_edit:
+                update_article_fields(
+                    ArticleEdit(
+                        article=str(art_sel),
+                        designation=new_design.strip(),
+                        garantie=int(new_gar),
+                        seuil_piece=int(new_seuil),
+                    )
+                )
+                cache_bust()
+                st.success("✅ Article modifié.")
+                st.rerun()
+
+
+# -------------------------
+# TAB 2 : STOCK ACTUEL + PIECES A COMMANDER + HISTORIQUE + SUPPRIMER (EN BAS)
+# -------------------------
 with tab_stock:
     st.subheader("Stock actuel")
 
@@ -311,19 +413,57 @@ with tab_stock:
         """
     )
 
-if search:
+    if search:
         df_view = df[
             df["article"].astype(str).str.lower().str.contains(search, na=False)
             | df["designation"].astype(str).str.lower().str.contains(search, na=False)
         ].copy()
-else:
-    df_view = df.copy()
+    else:
+        df_view = df.copy()
 
     st.dataframe(df_view, use_container_width=True, height=360)
 
     st.divider()
 
-    st.subheader("Historique (300 derniers)")
+    st.subheader("📦 Pièces à commander")
+
+    # Seuil global
+    seuil_global_db = get_setting_int("seuil_global", DEFAULT_SEUIL_GLOBAL)
+    col1, col2 = st.columns([1.2, 2.8])
+
+    with col1:
+        seuil_global = st.number_input(
+            "Seuil global (utilisé si seuil pièce = 0)",
+            min_value=0,
+            max_value=10_000,
+            value=int(seuil_global_db),
+            step=1,
+        )
+        if seuil_global != seuil_global_db:
+            set_setting("seuil_global", str(int(seuil_global)))
+            cache_bust()
+            st.success("✅ Seuil global mis à jour.")
+            st.rerun()
+
+    with col2:
+        # Calcul : seuil utilisé = seuil_piece si > 0 sinon seuil_global
+        tmp = df.copy()
+        tmp["seuil_utilise"] = tmp["seuil_piece"].apply(lambda x: int(x) if int(x) > 0 else int(seuil_global))
+        a_commander = tmp[tmp["stock"].astype(int) <= tmp["seuil_utilise"].astype(int)].copy()
+        a_commander = a_commander.sort_values(["stock", "designation", "article"], ascending=[True, True, True])
+
+        if a_commander.empty:
+            st.success("✅ Rien à commander.")
+        else:
+            st.dataframe(
+                a_commander[["article", "designation", "stock", "seuil_piece", "seuil_utilise"]],
+                use_container_width=True,
+                height=300,
+            )
+
+    st.divider()
+
+    st.subheader(f"Historique ({HIST_LIMIT} derniers)")
 
     hist = read_df(
         """
@@ -332,604 +472,76 @@ else:
                COALESCE(commentaire,'') AS commentaire
         FROM mouvements
         ORDER BY id DESC
-        LIMIT 300
-        """
+        LIMIT :lim
+        """,
+        {"lim": HIST_LIMIT},
     )
-    
     st.dataframe(hist, use_container_width=True, height=420)
-        # ------- SUPPRIMER -------
-from __future__ import annotations
-
-import pandas as pd
-import streamlit as st
-from datetime import date
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-
-st.set_page_config(page_title="Gestion de stock", layout="wide")
-
-# =========================
-#   CONFIG / DB ENGINE
-# =========================
-
-def get_engine() -> Engine:
-    """
-    DB_URL doit être dans Secrets Streamlit (TOML) :
-    DB_URL="postgresql+psycopg2://USER:PASSWORD@HOST:5432/postgres"
-    """
-    db_url = st.secrets.get("DB_URL", "").strip()
-    if not db_url:
-        st.error("DB_URL manquant. Va dans Streamlit -> Settings -> Secrets et ajoute DB_URL.")
-        st.stop()
-
-    # pool_pre_ping évite les connexions mortes
-    return create_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
-
-ENGINE = get_engine()
-
-def exec_sql(sql: str, params: dict | None = None) -> None:
-    params = params or {}
-    with ENGINE.begin() as conn:
-        conn.execute(text(sql), params)
-
-@st.cache_data(ttl=20)
-def read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
-    params = params or {}
-    with ENGINE.begin() as conn:
-        return pd.read_sql(text(sql), conn, params=params)
-
-def clear_cache():
-    st.cache_data.clear()
-
-# =========================
-#   INIT / MIGRATIONS DB
-# =========================
-
-def init_db():
-    # Tables principales
-    exec_sql("""
-    CREATE TABLE IF NOT EXISTS articles (
-        article TEXT PRIMARY KEY,
-        designation TEXT NOT NULL,
-        stock INTEGER NOT NULL DEFAULT 0,
-        garantie INTEGER NOT NULL DEFAULT 0,
-        seuil_piece INTEGER NULL
-    );
-    """)
-
-    exec_sql("""
-    CREATE TABLE IF NOT EXISTS mouvements (
-        id BIGSERIAL PRIMARY KEY,
-        date_mvt DATE NOT NULL,
-        article TEXT NOT NULL,
-        designation TEXT,
-        type_mvt TEXT NOT NULL,
-        emplacement TEXT NOT NULL,
-        quantite INTEGER NOT NULL,
-        adresse TEXT NULL,
-        commentaire TEXT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CONSTRAINT fk_mvt_article
-          FOREIGN KEY(article) REFERENCES articles(article)
-          ON UPDATE CASCADE
-          ON DELETE CASCADE
-    );
-    """)
-
-    exec_sql("""
-    CREATE TABLE IF NOT EXISTS adresses (
-        id BIGSERIAL PRIMARY KEY,
-        nom TEXT NOT NULL UNIQUE
-    );
-    """)
-
-    exec_sql("""
-    CREATE TABLE IF NOT EXISTS settings (
-        k TEXT PRIMARY KEY,
-        v TEXT NOT NULL
-    );
-    """)
-
-    # --- MIGRATIONS (si tu avais une ancienne DB)
-    # articles
-    exec_sql("ALTER TABLE articles ADD COLUMN IF NOT EXISTS garantie INTEGER NOT NULL DEFAULT 0;")
-    exec_sql("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seuil_piece INTEGER NULL;")
-
-    # mouvements
-    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS adresse TEXT NULL;")
-    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS commentaire TEXT NULL;")
-    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();")
-
-    # Index utiles
-    exec_sql("CREATE INDEX IF NOT EXISTS idx_mouvements_date ON mouvements(date_mvt);")
-    exec_sql("CREATE INDEX IF NOT EXISTS idx_mouvements_article ON mouvements(article);")
-
-init_db()
-
-# =========================
-#   SETTINGS HELPERS
-# =========================
-
-def get_setting(key: str, default: str) -> str:
-    df = read_df("SELECT v FROM settings WHERE k=:k", {"k": key})
-    if df.empty:
-        return default
-    return str(df.iloc[0]["v"])
-
-def set_setting(key: str, value: str) -> None:
-    exec_sql("""
-    INSERT INTO settings(k, v) VALUES (:k, :v)
-    ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v
-    """, {"k": key, "v": value})
-    clear_cache()
-
-# =========================
-#   BUSINESS HELPERS
-# =========================
-
-def get_article_designation(article: str) -> str:
-    df = read_df("SELECT designation FROM articles WHERE article=:a", {"a": article})
-    return "" if df.empty else str(df.iloc[0]["designation"])
-
-def get_article_row(article: str) -> dict | None:
-    df = read_df("""
-        SELECT article, designation, stock, garantie, COALESCE(seuil_piece, 0) AS seuil_piece
-        FROM articles
-        WHERE article = :a
-    """, {"a": article})
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
-
-def upsert_article(article: str, designation: str, seuil_piece: int | None = None, force_update_seuil: bool = False):
-    """
-    Crée l’article si absent.
-    Met à jour designation.
-    Met à jour seuil_piece si :
-      - force_update_seuil = True
-      - ou si l’article n’existe pas encore
-    """
-    existing = get_article_row(article)
-    if existing is None:
-        exec_sql("""
-        INSERT INTO articles(article, designation, stock, garantie, seuil_piece)
-        VALUES (:a, :d, 0, 0, :s)
-        """, {"a": article, "d": designation, "s": (None if (seuil_piece is None or seuil_piece == 0) else int(seuil_piece))})
-    else:
-        # update designation
-        exec_sql("""
-        UPDATE articles SET designation = :d
-        WHERE article = :a
-        """, {"a": article, "d": designation})
-
-        # update seuil_piece si demandé
-        if force_update_seuil:
-            exec_sql("""
-            UPDATE articles SET seuil_piece = :s
-            WHERE article = :a
-            """, {"a": article, "s": (None if (seuil_piece is None or seuil_piece == 0) else int(seuil_piece))})
-
-    clear_cache()
-
-def apply_mouvement(d: date, article: str, designation: str, type_mvt: str, emplacement: str, qty: int,
-                   adresse: str | None, commentaire: str | None):
-    """
-    Insère mouvement + met à jour le stock.
-    """
-    qty = int(qty)
-    if qty <= 0:
-        raise ValueError("Quantité invalide")
-
-    delta = qty if type_mvt == "ENTREE" else -qty
-
-    with ENGINE.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO mouvements(date_mvt, article, designation, type_mvt, emplacement, quantite, adresse, commentaire)
-            VALUES (:dt, :a, :d, :t, :e, :q, :adr, :c)
-        """), {"dt": d, "a": article, "d": designation, "t": type_mvt, "e": emplacement, "q": qty,
-               "adr": (adresse if adresse else None),
-               "c": (commentaire if commentaire else None)})
-
-        conn.execute(text("""
-            UPDATE articles SET stock = stock + :delta
-            WHERE article = :a
-        """), {"delta": delta, "a": article})
-
-    clear_cache()
-
-def rename_article(old: str, new: str):
-    """
-    Renomme un article : change la PK + met à jour les mouvements (FK ON UPDATE CASCADE aide déjà)
-    mais on fait proprement :
-    """
-    if old == new:
-        return
-
-    # si le nouveau existe déjà -> refuse (évite collision)
-    exists = read_df("SELECT 1 FROM articles WHERE article=:a", {"a": new})
-    if not exists.empty:
-        raise ValueError("Le nouveau numéro existe déjà.")
-
-    with ENGINE.begin() as conn:
-        # update PK (cascade sur mouvements grâce à FK ON UPDATE CASCADE)
-        conn.execute(text("UPDATE articles SET article=:new WHERE article=:old"), {"new": new, "old": old})
-
-    clear_cache()
-
-def delete_article(article: str):
-    exec_sql("DELETE FROM articles WHERE article=:a", {"a": article})
-    clear_cache()
-
-# =========================
-#   UI
-# =========================
-
-st.title("📦 Gestion de stock")
-
-tab_mvt, tab_stock, tab_addr = st.tabs(["➕ Mouvement", "📦 Stock actuel", "📍 Adresses"])
-
-# ---------------------------------
-# TAB 1 : MOUVEMENT (ajout + modifier)
-# ---------------------------------
-with tab_mvt:
-    st.subheader("Ajouter un mouvement")
-
-    # adresses existantes
-    df_addr = read_df("SELECT nom FROM adresses ORDER BY nom")
-    addr_list = df_addr["nom"].tolist() if not df_addr.empty else []
-
-    c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
-
-    with c1:
-        d = st.date_input("Date", value=date.today())
-        article = st.text_input("Numéro d'article", placeholder="Ex: 155082").strip()
-
-        # auto designation si article existe
-        auto_designation = get_article_designation(article) if article else ""
-        designation = st.text_input("Désignation", value=auto_designation, placeholder="Ex: Sonde O2").strip()
-
-        seuil_piece = st.number_input("Seuil pièce (0 = aucun, sinon seuil personnalisé)", min_value=0, max_value=100000, value=0, step=1)
-
-        force_update_seuil = st.checkbox("Mettre à jour le seuil de cette pièce (même si elle existe déjà)", value=True)
-
-    with c2:
-        emplacement = st.selectbox("Emplacement", ["STOCK", "CHANTIER", "CAMION", "AUTRE"])
-        type_mvt = st.selectbox("Type", ["ENTREE", "SORTIE"])
-        qty = st.number_input("Quantité", min_value=1, max_value=100000, value=1, step=1)
-
-        adresse = st.selectbox("Adresse (optionnel)", [""] + addr_list) if addr_list else st.text_input("Adresse (optionnel)").strip()
-
-    with c3:
-        commentaire = st.text_area("Remarque / commentaire (optionnel)", height=120)
-
-        if st.button("✅ Enregistrer", use_container_width=True):
-            if not article:
-                st.error("Numéro d'article obligatoire.")
-            elif not designation:
-                st.error("Désignation obligatoire.")
-            else:
-                try:
-                    upsert_article(article, designation, seuil_piece=int(seuil_piece), force_update_seuil=force_update_seuil)
-                    apply_mouvement(
-                        d=d,
-                        article=article,
-                        designation=designation,
-                        type_mvt=type_mvt,
-                        emplacement=emplacement,
-                        qty=int(qty),
-                        adresse=(adresse if isinstance(adresse, str) and adresse.strip() else None),
-                        commentaire=(commentaire.strip() if commentaire else None)
-                    )
-                    st.success("Mouvement enregistré ✅")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
 
     st.divider()
 
-    # ==========================
-    # MODIFIER UN ARTICLE (dans Mouvement)
-    # ==========================
-    st.subheader("Modifier un article (numéro / désignation / seuil / garantie)")
-
-    articles_df = read_df("""
-        SELECT article, designation, stock, garantie, COALESCE(seuil_piece, 0) AS seuil_piece
-        FROM articles
-        ORDER BY article
-    """)
-    articles_list = articles_df["article"].astype(str).tolist()
-
-    if len(articles_list) == 0:
-        st.info("Aucun article à modifier.")
-    else:
-        a_sel = st.selectbox("Choisir l'article", articles_list, index=0)
-        row = get_article_row(a_sel) or {}
-
-        cA, cB, cC = st.columns([1.2, 1.2, 1.2])
-
-        with cA:
-            new_num = st.text_input("Nouveau numéro (laisser identique si pas besoin)", value=str(a_sel)).strip()
-            new_design = st.text_input("Nouvelle désignation", value=str(row.get("designation", ""))).strip()
-
-        with cB:
-            new_seuil = st.number_input("Seuil personnalisé (0 = aucun)", min_value=0, max_value=100000, value=int(row.get("seuil_piece", 0)), step=1)
-            new_garantie = st.number_input("Garantie (quantité en garantie)", min_value=0, max_value=100000, value=int(row.get("garantie", 0)), step=1)
-
-        with cC:
-            st.write("")
-            st.write("")
-            if st.button("💾 Sauvegarder les modifications", use_container_width=True):
-                try:
-                    if not new_num:
-                        st.error("Le numéro ne peut pas être vide.")
-                        st.stop()
-
-                    # rename si nécessaire
-                    if new_num != a_sel:
-                        rename_article(a_sel, new_num)
-
-                    # update designation / seuil / garantie
-                    exec_sql("""
-                        UPDATE articles
-                        SET designation=:d,
-                            seuil_piece=:s,
-                            garantie=:g
-                        WHERE article=:a
-                    """, {
-                        "a": new_num,
-                        "d": new_design if new_design else row.get("designation", ""),
-                        "s": None if int(new_seuil) == 0 else int(new_seuil),
-                        "g": int(new_garantie),
-                    })
-
-                    clear_cache()
-                    st.success("Article modifié ✅")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
-
     st.subheader("🗑️ Supprimer un article (tout en bas)")
-    st.warning("⚠️ Supprime aussi les mouvements liés à cet article.")
+    st.warning("⚠️ Supprime aussi tous les mouvements liés à cet article.")
 
-    articles_df = read_df("SELECT article FROM articles ORDER BY article")
-    articles_list = articles_df["article"].astype(str).tolist()
+    articles_df2 = read_df("SELECT article FROM articles ORDER BY article")
+    articles_list2 = articles_df2["article"].astype(str).tolist()
 
-    if len(articles_list) > 0:
-
-        del_article = st.selectbox(
-            "Article à supprimer",
-            articles_list,
-            key="del_article"
-        )
-
-        confirm = st.checkbox(
-            "Je confirme la suppression définitive",
-            value=False
-        )
-
-        if st.button(
-            "❌ Supprimer définitivement",
-            use_container_width=True,
-            disabled=not confirm
-        ):
-            exec_sql(
-                "DELETE FROM mouvements WHERE article=:a",
-                {"a": del_article}
-            )
-            exec_sql(
-                "DELETE FROM articles WHERE article=:a",
-                {"a": del_article}
-            )
-            st.success("✅ Article supprimé.")
-            st.rerun()
-
-    else:
+    if not articles_list2:
         st.info("Aucun article à supprimer.")
+    else:
+        a_del = st.selectbox("Choisir l'article à supprimer", articles_list2, key="del_article_sel")
+        confirm = st.checkbox("Je confirme la suppression (irréversible)", value=False)
 
-# ---------------------------------
+        if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
+            try:
+                delete_article(str(a_del))
+                cache_bust()
+                st.success("✅ Article supprimé.")
+                st.rerun()
+            except Exception as e:
+                st.exception(e)
+
+
+# -------------------------
 # TAB 3 : ADRESSES
-# ---------------------------------
+# -------------------------
 with tab_addr:
     st.subheader("Adresses")
 
-    c1, c2 = st.columns([1.2, 1.0])
+    colL, colR = st.columns([1.3, 1.7])
 
-    with c1:
-        new_addr = st.text_input("Ajouter une adresse", placeholder="Ex: Chantier Dupont / 12 rue ...").strip()
-        if st.button("➕ Ajouter l’adresse"):
-            if not new_addr:
-                st.error("Adresse vide.")
+    with colL:
+        st.write("Ajouter une adresse")
+        with st.form("form_add_addr", clear_on_submit=True):
+            nom = st.text_input("Nom", placeholder="Ex: Client Dupont / Chantier X / etc.").strip()
+            ok = st.form_submit_button("➕ Ajouter", use_container_width=True)
+        if ok:
+            if not nom:
+                st.error("❌ Nom obligatoire.")
             else:
                 try:
-                    exec_sql("INSERT INTO adresses(nom) VALUES (:n) ON CONFLICT(nom) DO NOTHING", {"n": new_addr})
-                    clear_cache()
-                    st.success("Adresse ajoutée ✅")
+                    exec_sql("INSERT INTO adresses(nom) VALUES (:n)", {"n": nom})
+                    cache_bust()
+                    st.success("✅ Adresse ajoutée.")
+                    st.rerun()
+                except Exception as e:
+                    st.error("❌ Adresse déjà existante ou erreur DB.")
+                    st.exception(e)
+
+    with colR:
+        st.write("Liste / suppression")
+        addr = read_df("SELECT nom FROM adresses ORDER BY nom")
+        st.dataframe(addr, use_container_width=True, height=260)
+
+        if not addr.empty:
+            a = st.selectbox("Adresse à supprimer", addr["nom"].tolist(), key="addr_del_sel")
+            if st.button("🗑️ Supprimer l'adresse", use_container_width=True):
+                try:
+                    exec_sql("DELETE FROM adresses WHERE nom=:n", {"n": a})
+                    cache_bust()
+                    st.success("✅ Adresse supprimée.")
                     st.rerun()
                 except Exception as e:
                     st.exception(e)
-
-    with c2:
-        df_addr2 = read_df("SELECT nom FROM adresses ORDER BY nom")
-        addr_list2 = df_addr2["nom"].tolist() if not df_addr2.empty else []
-        if len(addr_list2) == 0:
-            st.info("Aucune adresse.")
-        else:
-            a_rm = st.selectbox("Supprimer une adresse", addr_list2)
-            if st.button("🗑️ Supprimer l’adresse"):
-                try:
-                    exec_sql("DELETE FROM adresses WHERE nom=:n", {"n": a_rm})
-                    clear_cache()
-                    st.success("Adresse supprimée ✅")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
-
-    st.divider()
-    st.subheader("Liste des adresses")
-    df_addr3 = read_df("SELECT nom FROM adresses ORDER BY nom")
-    st.dataframe(df_addr3, use_container_width=True, height=360)
-
-    # ------- PIECES A COMMANDER -------
-    st.subheader("📦 Pièces à commander")
-
-    seuil_global = int(get_setting("seuil_global", str(DEFAULT_SEUIL_GLOBAL)))
-    new_seuil_global = st.number_input(
-        "Seuil global (utilisé si seuil pièce = 0)",
-        min_value=0,
-        value=int(seuil_global),
-        step=1,
-    )
-    if int(new_seuil_global) != int(seuil_global):
-        set_setting("seuil_global", str(int(new_seuil_global)))
-        seuil_global = int(new_seuil_global)
-
-    df_cmd = df.copy()
-    df_cmd["seuil_utilise"] = df_cmd["seuil_piece"].apply(lambda sp: int(sp) if int(sp) > 0 else int(seuil_global))
-    df_cmd = df_cmd[df_cmd["stock"] <= df_cmd["seuil_utilise"]].copy()
-    df_cmd = df_cmd.sort_values(["stock", "designation", "article"])
-
-    if df_cmd.empty:
-        st.success("✅ Rien à commander")
-    else:
-        st.dataframe(
-            df_cmd[["article", "designation", "stock", "seuil_piece", "seuil_utilise"]],
-            use_container_width=True,
-            height=320,
-        )
-
-    st.divider()
-
-    # ------- MODIFIER ARTICLE -------
-    st.subheader("✏️ Modifier un article (y compris seuil pièce)")
-
-    articles_list = df["article"].tolist()
-    if not articles_list:
-        st.info("Aucun article.")
-    else:
-        a_sel = st.selectbox("Choisir un article", articles_list)
-
-        row = read_df(
-            """
-            SELECT article, designation, stock, garantie, seuil_piece
-            FROM articles
-            WHERE article=:a
-            """,
-            {"a": a_sel},
-        ).iloc[0]
-
-        c1, c2 = st.columns(2)
-        with c1:
-            new_article = st.text_input("Numéro", value=str(row["article"])).strip()
-            new_designation = st.text_input("Désignation", value=str(row["designation"])).strip()
-            new_stock = st.number_input("Stock", min_value=0, value=int(row["stock"]), step=1)
-        with c2:
-            new_garantie = st.number_input("Garantie", min_value=0, value=int(row["garantie"]), step=1)
-            sp_val = 0 if row["seuil_piece"] is None else int(row["seuil_piece"])
-            new_sp = st.number_input("Seuil pièce (0 = aucun)", min_value=0, value=int(sp_val), step=1)
-
-        update_hist = st.checkbox(
-            "Mettre à jour aussi l'historique (mouvements) si le numéro change",
-            value=True,
-            help="Si tu changes le numéro d'article, on met à jour les mouvements aussi.",
-        )
-
-        if st.button("💾 Enregistrer modifications", use_container_width=True):
-            if not new_article:
-                st.error("Numéro vide.")
-                st.stop()
-            if not new_designation:
-                st.error("Désignation vide.")
-                st.stop()
-
-            sp_to_store = None if int(new_sp) == 0 else int(new_sp)
-            old_article = str(row["article"]).strip()
-
-            # Update articles
-            exec_sql(
-                """
-                UPDATE articles
-                SET article=:newa,
-                    designation=:d,
-                    stock=:s,
-                    garantie=:g,
-                    seuil_piece=:sp
-                WHERE article=:olda
-                """,
-                {
-                    "newa": new_article,
-                    "d": new_designation,
-                    "s": int(new_stock),
-                    "g": int(new_garantie),
-                    "sp": sp_to_store,
-                    "olda": old_article,
-                },
-            )
-
-            # Update mouvements if requested
-            if update_hist and new_article != old_article:
-                exec_sql(
-                    "UPDATE mouvements SET article=:newa WHERE article=:olda",
-                    {"newa": new_article, "olda": old_article},
-                )
-
-            # Update designation in mouvements (optionnel mais logique)
-            exec_sql(
-                "UPDATE mouvements SET designation=:d WHERE article=:a",
-                {"d": new_designation, "a": new_article},
-            )
-
-            st.success("✅ Article modifié ! (Recharge si besoin)")
-
-    st.divider()
-
-
-# ==========================================================
-# TAB 3 : ADRESSES
-# ==========================================================
-with tab_addr:
-    st.subheader("📍 Adresses")
-
-    left, right = st.columns(2)
-
-    with left:
-        st.markdown("### Ajouter une adresse")
-        new_addr = st.text_input("Nom", placeholder="Ex: Client Dupont / Chantier X").strip()
-        if st.button("➕ Ajouter", use_container_width=True):
-            if not new_addr:
-                st.error("Nom vide.")
-            else:
-                exec_sql(
-                    """
-                    INSERT INTO adresses(nom)
-                    VALUES(:n)
-                    ON CONFLICT(nom) DO NOTHING
-                    """,
-                    {"n": new_addr},
-                )
-                st.success("✅ Adresse ajoutée.")
-
-    with right:
-        st.markdown("### Supprimer une adresse")
-        adf2 = read_df("SELECT nom FROM adresses ORDER BY nom")
-        alist = adf2["nom"].tolist()
-        if alist:
-            addr_del = st.selectbox("Adresse", alist)
-            if st.button("🗑️ Supprimer", use_container_width=True):
-                exec_sql("DELETE FROM adresses WHERE nom=:n", {"n": addr_del})
-                st.success("✅ Adresse supprimée.")
         else:
             st.info("Aucune adresse enregistrée.")
-
-    st.divider()
-    st.markdown("### Liste")
-    st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
-
-
-
-
-
-
-
-
-
-
