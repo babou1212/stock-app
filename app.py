@@ -248,6 +248,24 @@ with tab_mvt:
     addr_df = read_df("SELECT nom FROM adresses ORDER BY nom")
     addr_list = [""] + addr_df["nom"].tolist()
 
+    def get_designation_for_article(article: str) -> str:
+    if not article:
+        return ""
+    df = read_df(
+        "SELECT designation FROM articles WHERE article=:a",
+        {"a": article},
+        bust=st.session_state.get("_cache_bust", 0),
+    )
+    if df.empty:
+        return ""
+    return str(df.iloc[0]["designation"] or "")
+
+def on_article_change():
+    a = (st.session_state.get("mvt_article") or "").strip()
+    # si l'utilisateur n'a rien tapé en désignation, on auto-remplit depuis la DB
+    if a and not (st.session_state.get("mvt_designation") or "").strip():
+        st.session_state["mvt_designation"] = get_designation_for_article(a)
+
     with st.form("form_mvt", clear_on_submit=False):
         c1, c2, c3 = st.columns([1.1, 1.1, 1.8])
 
@@ -533,3 +551,4 @@ with tab_addr:
                 st.rerun()
             except Exception as e:
                 st.exception(e)
+
