@@ -294,7 +294,6 @@ with tab_mvt:
 
     st.divider()
   
-    st.dataframe(hist, use_container_width=True, height=420)
 
 # ==========================================================
 # TAB 2 : STOCK ACTUEL
@@ -336,6 +335,8 @@ with tab_stock:
         LIMIT 300
         """
     )
+    
+    st.dataframe(hist, use_container_width=True, height=420)
         # ------- SUPPRIMER -------
     st.subheader("🗑️ Supprimer un article (tout en bas)")
 
@@ -505,5 +506,6 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
 
