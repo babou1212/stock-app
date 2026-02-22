@@ -338,8 +338,7 @@ else:
     
     st.dataframe(hist, use_container_width=True, height=420)
         # ------- SUPPRIMER -------
-from __future__ 
-import annotations
+from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
@@ -924,6 +923,7 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
 
 
