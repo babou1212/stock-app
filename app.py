@@ -293,18 +293,7 @@ with tab_mvt:
             st.success("✅ Mouvement enregistré !")
 
     st.divider()
-    st.subheader("Historique (300 derniers)")
-
-    hist = read_df(
-        """
-        SELECT id, date_mvt, article, designation, type_mvt, emplacement, quantite,
-               COALESCE(adresse,'') AS adresse,
-               COALESCE(commentaire,'') AS commentaire
-        FROM mouvements
-        ORDER BY id DESC
-        LIMIT 300
-        """
-    )
+  
     st.dataframe(hist, use_container_width=True, height=420)
 
 # ==========================================================
@@ -334,6 +323,33 @@ with tab_stock:
     st.dataframe(df_view, use_container_width=True, height=360)
 
     st.divider()
+
+      st.subheader("Historique (300 derniers)")
+
+    hist = read_df(
+        """
+        SELECT id, date_mvt, article, designation, type_mvt, emplacement, quantite,
+               COALESCE(adresse,'') AS adresse,
+               COALESCE(commentaire,'') AS commentaire
+        FROM mouvements
+        ORDER BY id DESC
+        LIMIT 300
+        """
+    )
+        # ------- SUPPRIMER -------
+    st.subheader("🗑️ Supprimer un article (tout en bas)")
+
+    st.warning("⚠️ Supprime aussi les mouvements liés à cet article.")
+    if articles_list:
+        del_article = st.selectbox("Article à supprimer", articles_list, key="del_article")
+        confirm = st.checkbox("Je confirme la suppression définitive", value=False)
+
+        if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
+            exec_sql("DELETE FROM mouvements WHERE article=:a", {"a": del_article})
+            exec_sql("DELETE FROM articles WHERE article=:a", {"a": del_article})
+            st.success("✅ Article supprimé.")
+    else:
+        st.info("Aucun article à supprimer.")
 
     # ------- PIECES A COMMANDER -------
     st.subheader("📦 Pièces à commander")
@@ -448,20 +464,6 @@ with tab_stock:
 
     st.divider()
 
-    # ------- SUPPRIMER (TOUT EN BAS) -------
-    st.subheader("🗑️ Supprimer un article (tout en bas)")
-
-    st.warning("⚠️ Supprime aussi les mouvements liés à cet article.")
-    if articles_list:
-        del_article = st.selectbox("Article à supprimer", articles_list, key="del_article")
-        confirm = st.checkbox("Je confirme la suppression définitive", value=False)
-
-        if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
-            exec_sql("DELETE FROM mouvements WHERE article=:a", {"a": del_article})
-            exec_sql("DELETE FROM articles WHERE article=:a", {"a": del_article})
-            st.success("✅ Article supprimé.")
-    else:
-        st.info("Aucun article à supprimer.")
 
 # ==========================================================
 # TAB 3 : ADRESSES
@@ -503,3 +505,4 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
