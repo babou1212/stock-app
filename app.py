@@ -407,7 +407,7 @@ with tab_stock:
 
     df = read_df(
         """
-        SELECT article, designation, stock, garantie, COALESCE(seuil_piece,0) AS seuil_piece
+        SELECT article, designation, stock, COALESCE(seuil_piece,0) AS seuil_piece
         FROM articles
         ORDER BY article
         """
