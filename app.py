@@ -460,7 +460,23 @@ with tab_stock:
                 use_container_width=True,
                 height=300,
             )
+st.divider()
 
+st.subheader("🛡️ Tableau des garanties")
+
+garantie_df = read_df(
+    """
+    SELECT article, designation, garantie
+    FROM articles
+    WHERE garantie > 0
+    ORDER BY garantie DESC, article
+    """
+)
+
+if garantie_df.empty:
+    st.info("Aucune pièce avec garantie définie.")
+else:
+    st.dataframe(garantie_df, use_container_width=True, height=300)
     st.divider()
 
     st.subheader(f"Historique ({HIST_LIMIT} derniers)")
@@ -545,3 +561,4 @@ with tab_addr:
                     st.exception(e)
         else:
             st.info("Aucune adresse enregistrée.")
+
