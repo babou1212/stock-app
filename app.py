@@ -324,7 +324,7 @@ with tab_stock:
 
     st.divider()
 
-      st.subheader("Historique (300 derniers)")
+    st.subheader("Historique (300 derniers)")
 
     hist = read_df(
         """
@@ -505,4 +505,5 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
