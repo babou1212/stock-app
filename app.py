@@ -338,22 +338,490 @@ else:
     
     st.dataframe(hist, use_container_width=True, height=420)
         # ------- SUPPRIMER -------
+   from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+from datetime import date
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+st.set_page_config(page_title="Gestion de stock", layout="wide")
+
+# =========================
+#   CONFIG / DB ENGINE
+# =========================
+
+def get_engine() -> Engine:
+    """
+    DB_URL doit être dans Secrets Streamlit (TOML) :
+    DB_URL="postgresql+psycopg2://USER:PASSWORD@HOST:5432/postgres"
+    """
+    db_url = st.secrets.get("DB_URL", "").strip()
+    if not db_url:
+        st.error("DB_URL manquant. Va dans Streamlit -> Settings -> Secrets et ajoute DB_URL.")
+        st.stop()
+
+    # pool_pre_ping évite les connexions mortes
+    return create_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
+
+ENGINE = get_engine()
+
+def exec_sql(sql: str, params: dict | None = None) -> None:
+    params = params or {}
+    with ENGINE.begin() as conn:
+        conn.execute(text(sql), params)
+
+@st.cache_data(ttl=20)
+def read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    params = params or {}
+    with ENGINE.begin() as conn:
+        return pd.read_sql(text(sql), conn, params=params)
+
+def clear_cache():
+    st.cache_data.clear()
+
+# =========================
+#   INIT / MIGRATIONS DB
+# =========================
+
+def init_db():
+    # Tables principales
+    exec_sql("""
+    CREATE TABLE IF NOT EXISTS articles (
+        article TEXT PRIMARY KEY,
+        designation TEXT NOT NULL,
+        stock INTEGER NOT NULL DEFAULT 0,
+        garantie INTEGER NOT NULL DEFAULT 0,
+        seuil_piece INTEGER NULL
+    );
+    """)
+
+    exec_sql("""
+    CREATE TABLE IF NOT EXISTS mouvements (
+        id BIGSERIAL PRIMARY KEY,
+        date_mvt DATE NOT NULL,
+        article TEXT NOT NULL,
+        designation TEXT,
+        type_mvt TEXT NOT NULL,
+        emplacement TEXT NOT NULL,
+        quantite INTEGER NOT NULL,
+        adresse TEXT NULL,
+        commentaire TEXT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT fk_mvt_article
+          FOREIGN KEY(article) REFERENCES articles(article)
+          ON UPDATE CASCADE
+          ON DELETE CASCADE
+    );
+    """)
+
+    exec_sql("""
+    CREATE TABLE IF NOT EXISTS adresses (
+        id BIGSERIAL PRIMARY KEY,
+        nom TEXT NOT NULL UNIQUE
+    );
+    """)
+
+    exec_sql("""
+    CREATE TABLE IF NOT EXISTS settings (
+        k TEXT PRIMARY KEY,
+        v TEXT NOT NULL
+    );
+    """)
+
+    # --- MIGRATIONS (si tu avais une ancienne DB)
+    # articles
+    exec_sql("ALTER TABLE articles ADD COLUMN IF NOT EXISTS garantie INTEGER NOT NULL DEFAULT 0;")
+    exec_sql("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seuil_piece INTEGER NULL;")
+
+    # mouvements
+    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS adresse TEXT NULL;")
+    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS commentaire TEXT NULL;")
+    exec_sql("ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();")
+
+    # Index utiles
+    exec_sql("CREATE INDEX IF NOT EXISTS idx_mouvements_date ON mouvements(date_mvt);")
+    exec_sql("CREATE INDEX IF NOT EXISTS idx_mouvements_article ON mouvements(article);")
+
+init_db()
+
+# =========================
+#   SETTINGS HELPERS
+# =========================
+
+def get_setting(key: str, default: str) -> str:
+    df = read_df("SELECT v FROM settings WHERE k=:k", {"k": key})
+    if df.empty:
+        return default
+    return str(df.iloc[0]["v"])
+
+def set_setting(key: str, value: str) -> None:
+    exec_sql("""
+    INSERT INTO settings(k, v) VALUES (:k, :v)
+    ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v
+    """, {"k": key, "v": value})
+    clear_cache()
+
+# =========================
+#   BUSINESS HELPERS
+# =========================
+
+def get_article_designation(article: str) -> str:
+    df = read_df("SELECT designation FROM articles WHERE article=:a", {"a": article})
+    return "" if df.empty else str(df.iloc[0]["designation"])
+
+def get_article_row(article: str) -> dict | None:
+    df = read_df("""
+        SELECT article, designation, stock, garantie, COALESCE(seuil_piece, 0) AS seuil_piece
+        FROM articles
+        WHERE article = :a
+    """, {"a": article})
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+def upsert_article(article: str, designation: str, seuil_piece: int | None = None, force_update_seuil: bool = False):
+    """
+    Crée l’article si absent.
+    Met à jour designation.
+    Met à jour seuil_piece si :
+      - force_update_seuil = True
+      - ou si l’article n’existe pas encore
+    """
+    existing = get_article_row(article)
+    if existing is None:
+        exec_sql("""
+        INSERT INTO articles(article, designation, stock, garantie, seuil_piece)
+        VALUES (:a, :d, 0, 0, :s)
+        """, {"a": article, "d": designation, "s": (None if (seuil_piece is None or seuil_piece == 0) else int(seuil_piece))})
+    else:
+        # update designation
+        exec_sql("""
+        UPDATE articles SET designation = :d
+        WHERE article = :a
+        """, {"a": article, "d": designation})
+
+        # update seuil_piece si demandé
+        if force_update_seuil:
+            exec_sql("""
+            UPDATE articles SET seuil_piece = :s
+            WHERE article = :a
+            """, {"a": article, "s": (None if (seuil_piece is None or seuil_piece == 0) else int(seuil_piece))})
+
+    clear_cache()
+
+def apply_mouvement(d: date, article: str, designation: str, type_mvt: str, emplacement: str, qty: int,
+                   adresse: str | None, commentaire: str | None):
+    """
+    Insère mouvement + met à jour le stock.
+    """
+    qty = int(qty)
+    if qty <= 0:
+        raise ValueError("Quantité invalide")
+
+    delta = qty if type_mvt == "ENTREE" else -qty
+
+    with ENGINE.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO mouvements(date_mvt, article, designation, type_mvt, emplacement, quantite, adresse, commentaire)
+            VALUES (:dt, :a, :d, :t, :e, :q, :adr, :c)
+        """), {"dt": d, "a": article, "d": designation, "t": type_mvt, "e": emplacement, "q": qty,
+               "adr": (adresse if adresse else None),
+               "c": (commentaire if commentaire else None)})
+
+        conn.execute(text("""
+            UPDATE articles SET stock = stock + :delta
+            WHERE article = :a
+        """), {"delta": delta, "a": article})
+
+    clear_cache()
+
+def rename_article(old: str, new: str):
+    """
+    Renomme un article : change la PK + met à jour les mouvements (FK ON UPDATE CASCADE aide déjà)
+    mais on fait proprement :
+    """
+    if old == new:
+        return
+
+    # si le nouveau existe déjà -> refuse (évite collision)
+    exists = read_df("SELECT 1 FROM articles WHERE article=:a", {"a": new})
+    if not exists.empty:
+        raise ValueError("Le nouveau numéro existe déjà.")
+
+    with ENGINE.begin() as conn:
+        # update PK (cascade sur mouvements grâce à FK ON UPDATE CASCADE)
+        conn.execute(text("UPDATE articles SET article=:new WHERE article=:old"), {"new": new, "old": old})
+
+    clear_cache()
+
+def delete_article(article: str):
+    exec_sql("DELETE FROM articles WHERE article=:a", {"a": article})
+    clear_cache()
+
+# =========================
+#   UI
+# =========================
+
+st.title("📦 Gestion de stock")
+
+tab_mvt, tab_stock, tab_addr = st.tabs(["➕ Mouvement", "📦 Stock actuel", "📍 Adresses"])
+
+# ---------------------------------
+# TAB 1 : MOUVEMENT (ajout + modifier)
+# ---------------------------------
+with tab_mvt:
+    st.subheader("Ajouter un mouvement")
+
+    # adresses existantes
+    df_addr = read_df("SELECT nom FROM adresses ORDER BY nom")
+    addr_list = df_addr["nom"].tolist() if not df_addr.empty else []
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
+
+    with c1:
+        d = st.date_input("Date", value=date.today())
+        article = st.text_input("Numéro d'article", placeholder="Ex: 155082").strip()
+
+        # auto designation si article existe
+        auto_designation = get_article_designation(article) if article else ""
+        designation = st.text_input("Désignation", value=auto_designation, placeholder="Ex: Sonde O2").strip()
+
+        seuil_piece = st.number_input("Seuil pièce (0 = aucun, sinon seuil personnalisé)", min_value=0, max_value=100000, value=0, step=1)
+
+        force_update_seuil = st.checkbox("Mettre à jour le seuil de cette pièce (même si elle existe déjà)", value=True)
+
+    with c2:
+        emplacement = st.selectbox("Emplacement", ["STOCK", "CHANTIER", "CAMION", "AUTRE"])
+        type_mvt = st.selectbox("Type", ["ENTREE", "SORTIE"])
+        qty = st.number_input("Quantité", min_value=1, max_value=100000, value=1, step=1)
+
+        adresse = st.selectbox("Adresse (optionnel)", [""] + addr_list) if addr_list else st.text_input("Adresse (optionnel)").strip()
+
+    with c3:
+        commentaire = st.text_area("Remarque / commentaire (optionnel)", height=120)
+
+        if st.button("✅ Enregistrer", use_container_width=True):
+            if not article:
+                st.error("Numéro d'article obligatoire.")
+            elif not designation:
+                st.error("Désignation obligatoire.")
+            else:
+                try:
+                    upsert_article(article, designation, seuil_piece=int(seuil_piece), force_update_seuil=force_update_seuil)
+                    apply_mouvement(
+                        d=d,
+                        article=article,
+                        designation=designation,
+                        type_mvt=type_mvt,
+                        emplacement=emplacement,
+                        qty=int(qty),
+                        adresse=(adresse if isinstance(adresse, str) and adresse.strip() else None),
+                        commentaire=(commentaire.strip() if commentaire else None)
+                    )
+                    st.success("Mouvement enregistré ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.exception(e)
+
+    st.divider()
+
+    # ==========================
+    # MODIFIER UN ARTICLE (dans Mouvement)
+    # ==========================
+    st.subheader("Modifier un article (numéro / désignation / seuil / garantie)")
+
+    articles_df = read_df("""
+        SELECT article, designation, stock, garantie, COALESCE(seuil_piece, 0) AS seuil_piece
+        FROM articles
+        ORDER BY article
+    """)
+    articles_list = articles_df["article"].astype(str).tolist()
+
+    if len(articles_list) == 0:
+        st.info("Aucun article à modifier.")
+    else:
+        a_sel = st.selectbox("Choisir l'article", articles_list, index=0)
+        row = get_article_row(a_sel) or {}
+
+        cA, cB, cC = st.columns([1.2, 1.2, 1.2])
+
+        with cA:
+            new_num = st.text_input("Nouveau numéro (laisser identique si pas besoin)", value=str(a_sel)).strip()
+            new_design = st.text_input("Nouvelle désignation", value=str(row.get("designation", ""))).strip()
+
+        with cB:
+            new_seuil = st.number_input("Seuil personnalisé (0 = aucun)", min_value=0, max_value=100000, value=int(row.get("seuil_piece", 0)), step=1)
+            new_garantie = st.number_input("Garantie (quantité en garantie)", min_value=0, max_value=100000, value=int(row.get("garantie", 0)), step=1)
+
+        with cC:
+            st.write("")
+            st.write("")
+            if st.button("💾 Sauvegarder les modifications", use_container_width=True):
+                try:
+                    if not new_num:
+                        st.error("Le numéro ne peut pas être vide.")
+                        st.stop()
+
+                    # rename si nécessaire
+                    if new_num != a_sel:
+                        rename_article(a_sel, new_num)
+
+                    # update designation / seuil / garantie
+                    exec_sql("""
+                        UPDATE articles
+                        SET designation=:d,
+                            seuil_piece=:s,
+                            garantie=:g
+                        WHERE article=:a
+                    """, {
+                        "a": new_num,
+                        "d": new_design if new_design else row.get("designation", ""),
+                        "s": None if int(new_seuil) == 0 else int(new_seuil),
+                        "g": int(new_garantie),
+                    })
+
+                    clear_cache()
+                    st.success("Article modifié ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.exception(e)
+
+# ---------------------------------
+# TAB 2 : STOCK ACTUEL (stock + pièces à commander + historique + suppression)
+# ---------------------------------
+with tab_stock:
+    st.subheader("Stock actuel")
+
+    # seuil global (si seuil_piece vide)
+    default_seuil = int(get_setting("seuil_commande", "3"))
+    seuil_global = st.number_input("Seuil global (utilisé si 'seuil pièce' = 0)", min_value=0, max_value=100000, value=default_seuil, step=1)
+    if int(seuil_global) != default_seuil:
+        set_setting("seuil_commande", str(int(seuil_global)))
+
+    search = st.text_input("Recherche", placeholder="Numéro ou mot dans désignation...").strip().lower()
+
+    df = read_df("""
+        SELECT article, designation, stock, garantie, COALESCE(seuil_piece, 0) AS seuil_piece
+        FROM articles
+        ORDER BY article
+    """)
+
+    if search:
+        df_view = df[
+            df["article"].astype(str).str.lower().str.contains(search, na=False)
+            | df["designation"].astype(str).str.lower().str.contains(search, na=False)
+        ].copy()
+    else:
+        df_view = df.copy()
+
+    st.dataframe(df_view, use_container_width=True, height=360)
+
+    st.divider()
+
+    # Pièces à commander
+    st.subheader("📦 Pièces à commander")
+
+    # seuil utilisé : seuil_piece si >0 sinon seuil_global
+    if not df.empty:
+        df2 = df.copy()
+        df2["seuil_utilise"] = df2["seuil_piece"].apply(lambda x: int(x) if int(x) > 0 else int(seuil_global))
+        a_commander = df2[df2["stock"] <= df2["seuil_utilise"]].copy()
+        a_commander = a_commander.sort_values(["stock", "designation", "article"])
+        if a_commander.empty:
+            st.success("Rien à commander ✅")
+        else:
+            st.dataframe(
+                a_commander[["article", "designation", "stock", "seuil_piece", "seuil_utilise"]],
+                use_container_width=True,
+                height=320
+            )
+    else:
+        st.info("Aucun article en base.")
+
+    st.divider()
+
+    # Historique (ici, dans Stock actuel)
+    st.subheader("Historique (300 derniers)")
+
+    hist = read_df("""
+        SELECT id, date_mvt, article, designation, type_mvt, emplacement, quantite,
+               COALESCE(adresse,'') AS adresse,
+               COALESCE(commentaire,'') AS commentaire
+        FROM mouvements
+        ORDER BY id DESC
+        LIMIT 300
+    """)
+
+    if hist.empty:
+        st.info("Aucun mouvement pour l’instant.")
+    else:
+        st.dataframe(hist, use_container_width=True, height=420)
+
+    st.divider()
+
+    # Supprimer un article (en bas dans Stock actuel)
     st.subheader("🗑️ Supprimer un article (tout en bas)")
 
-    st.warning("⚠️ Supprime aussi les mouvements liés à cet article.")
-    articles_df = read_df("SELECT article FROM articles ORDER BY article")
-articles_list = articles_df["article"].astype(str).tolist()
-    
-if len(articles_list) >0:
-        del_article = st.selectbox("Article à supprimer", articles_list, key="del_article")
-        confirm = st.checkbox("Je confirme la suppression définitive", value=False)
+    articles_df2 = read_df("SELECT article FROM articles ORDER BY article")
+    articles_list2 = articles_df2["article"].astype(str).tolist()
 
-if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
-            exec_sql("DELETE FROM mouvements WHERE article=:a", {"a": del_article})
-            exec_sql("DELETE FROM articles WHERE article=:a", {"a": del_article})
-            st.success("✅ Article supprimé.")
-else:
+    if len(articles_list2) == 0:
         st.info("Aucun article à supprimer.")
+    else:
+        a_del = st.selectbox("Choisir l'article à supprimer", articles_list2)
+        confirm = st.checkbox("Je confirme la suppression (irréversible)", value=False)
+        if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
+            try:
+                delete_article(a_del)
+                st.success("Article supprimé ✅")
+                st.rerun()
+            except Exception as e:
+                st.exception(e)
+
+# ---------------------------------
+# TAB 3 : ADRESSES
+# ---------------------------------
+with tab_addr:
+    st.subheader("Adresses")
+
+    c1, c2 = st.columns([1.2, 1.0])
+
+    with c1:
+        new_addr = st.text_input("Ajouter une adresse", placeholder="Ex: Chantier Dupont / 12 rue ...").strip()
+        if st.button("➕ Ajouter l’adresse"):
+            if not new_addr:
+                st.error("Adresse vide.")
+            else:
+                try:
+                    exec_sql("INSERT INTO adresses(nom) VALUES (:n) ON CONFLICT(nom) DO NOTHING", {"n": new_addr})
+                    clear_cache()
+                    st.success("Adresse ajoutée ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.exception(e)
+
+    with c2:
+        df_addr2 = read_df("SELECT nom FROM adresses ORDER BY nom")
+        addr_list2 = df_addr2["nom"].tolist() if not df_addr2.empty else []
+        if len(addr_list2) == 0:
+            st.info("Aucune adresse.")
+        else:
+            a_rm = st.selectbox("Supprimer une adresse", addr_list2)
+            if st.button("🗑️ Supprimer l’adresse"):
+                try:
+                    exec_sql("DELETE FROM adresses WHERE nom=:n", {"n": a_rm})
+                    clear_cache()
+                    st.success("Adresse supprimée ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.exception(e)
+
+    st.divider()
+    st.subheader("Liste des adresses")
+    df_addr3 = read_df("SELECT nom FROM adresses ORDER BY nom")
+    st.dataframe(df_addr3, use_container_width=True, height=360)
 
     # ------- PIECES A COMMANDER -------
     st.subheader("📦 Pièces à commander")
@@ -509,6 +977,7 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
 
 
