@@ -460,12 +460,12 @@ with tab_stock:
                 use_container_width=True,
                 height=300,
             )
-st.divider()
+            st.divider()
 
-st.subheader("🛡️ Tableau des garanties")
+            st.subheader("🛡️ Tableau des garanties")
 
-garantie_df = read_df(
-    """
+                garantie_df = read_df(
+                    """
     SELECT article, designation, garantie
     FROM articles
     WHERE garantie > 0
@@ -561,4 +561,5 @@ with tab_addr:
                     st.exception(e)
         else:
             st.info("Aucune adresse enregistrée.")
+
 
