@@ -311,12 +311,12 @@ with tab_stock:
         """
     )
 
-    if search:
+if search:
         df_view = df[
             df["article"].astype(str).str.lower().str.contains(search, na=False)
             | df["designation"].astype(str).str.lower().str.contains(search, na=False)
         ].copy()
-    else:
+else:
         df_view = df.copy()
 
     st.dataframe(df_view, use_container_width=True, height=360)
@@ -344,15 +344,15 @@ with tab_stock:
     articles_df = read_df("SELECT article FROM articles ORDER BY article")
 articles_list = articles_df["article"].astype(str).tolist()
     
-    if len(articles_list) >0:
+if len(articles_list) >0:
         del_article = st.selectbox("Article à supprimer", articles_list, key="del_article")
         confirm = st.checkbox("Je confirme la suppression définitive", value=False)
 
-        if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
+if st.button("❌ Supprimer définitivement", use_container_width=True, disabled=not confirm):
             exec_sql("DELETE FROM mouvements WHERE article=:a", {"a": del_article})
             exec_sql("DELETE FROM articles WHERE article=:a", {"a": del_article})
             st.success("✅ Article supprimé.")
-    else:
+else:
         st.info("Aucun article à supprimer.")
 
     # ------- PIECES A COMMANDER -------
@@ -509,6 +509,7 @@ with tab_addr:
     st.divider()
     st.markdown("### Liste")
     st.dataframe(read_df("SELECT nom FROM adresses ORDER BY nom"), use_container_width=True, height=380)
+
 
 
 
