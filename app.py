@@ -1,5 +1,4 @@
 # app.py
-from _future_ import annotations
 
 import os
 import datetime as dt
