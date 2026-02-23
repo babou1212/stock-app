@@ -388,146 +388,140 @@ st.title("📦 Gestion de stock")
 
 tab_mvt, tab_stock, tab_addr = st.tabs(["➕ Mouvement", "📦 Stock actuel", "📍 Adresses"])
 
-# ============================================================
-# TAB 1 : MOUVEMENT
-# ============================================================
+# ==========================
+# TAB 1 : MOUVEMENTS
+# ==========================
 with tab_mvt:
     st.subheader("Ajouter un mouvement")
 
+    # --------------------------
+    # Helpers
+    # --------------------------
+    def get_designation(article: str) -> str:
+        if not article:
+            return ""
+        df = read_df(
+            """
+            SELECT designation
+            FROM articles
+            WHERE article = :a
+            LIMIT 1
+            """,
+            {"a": str(article).strip()},
+        )
+        if df.empty:
+            return ""
+        val = df.iloc[0]["designation"]
+        return "" if val is None else str(val)
+
+    def sync_designation_from_article():
+        a = st.session_state.get("mvt_article", "").strip()
+        st.session_state["mvt_designation"] = get_designation(a)
+
+    # --------------------------
+    # Charge adresses
+    # --------------------------
     addr_df = read_df("SELECT nom FROM adresses ORDER BY nom")
     addr_list = [""] + addr_df["nom"].astype(str).tolist()
 
+    # --------------------------
+    # Article + auto-fill designation (HORS FORM)
+    # --------------------------
+    c1, c2 = st.columns([1.2, 2])
+
+    with c1:
+        st.text_input(
+            "Numéro d'article",
+            key="mvt_article",
+            placeholder="Ex: 155082",
+            on_change=sync_designation_from_article,  # ✅ autorisé car hors form
+        )
+
+    with c2:
+        st.text_input(
+            "Désignation",
+            key="mvt_designation",
+            placeholder="Se remplit si l'article existe (sinon tu peux écrire)",
+        )
+
+    # --------------------------
+    # FORM (sans callback)
+    # --------------------------
     with st.form("form_mvt", clear_on_submit=False):
-        c1, c2, c3 = st.columns([1.2, 1.0, 1.3])
+        colA, colB, colC = st.columns([1.1, 1.1, 1.8])
 
-        with c1:
+        with colA:
             date_mvt = st.date_input("Date", value=dt.date.today())
-            st.text_input(
-                "Numéro d'article",
-                key="mvt_article",
-                placeholder="Ex: 155082",
-                on_change=on_article_change,
-            )
-            st.text_input("Désignation", key="mvt_designation", placeholder="Ex: Sonde O2")
 
-        with c2:
+        with colB:
             emplacement = st.selectbox("Emplacement", ["STOCK"], index=0)
             type_mvt = st.selectbox("Type", ["ENTREE", "SORTIE"], index=0)
-            quantite = st.number_input("Quantité", min_value=1, max_value=10000, value=1, step=1)
+            quantite = st.number_input("Quantité", min_value=1, max_value=10_000, value=1, step=1)
 
-            st.caption("Seuil pièce : 0 = aucun (seuil global utilisé)")
-            seuil_piece = st.number_input("Seuil pièce (optionnel)", min_value=0, max_value=10000, value=0, step=1)
-            maj_seuil = st.checkbox("Mettre à jour le seuil de cette pièce (même si elle existe déjà)", value=True)
-
-        with c3:
+        with colC:
             commentaire = st.text_area("Remarque / commentaire (optionnel)", height=120)
             adresse = st.selectbox("Adresse (optionnel)", addr_list, index=0)
 
+        maj_seuil = st.checkbox("Mettre à jour le seuil de cette pièce (même si elle existe déjà)", value=True)
+        seuil_piece = st.number_input(
+            "Seuil pièce (0 = aucun, sinon seuil personnalisé)",
+            min_value=0,
+            max_value=10_000,
+            value=0,
+            step=1,
+        )
+
         submitted = st.form_submit_button("✅ Enregistrer", use_container_width=True)
 
+    # --------------------------
+    # Submit logic
+    # --------------------------
     if submitted:
-        article = normalize_article(st.session_state.get("mvt_article", ""))
-        designation = (st.session_state.get("mvt_designation") or "").strip()
+        article = str(st.session_state.get("mvt_article", "")).strip()
+        designation = str(st.session_state.get("mvt_designation", "")).strip()
 
         if not article:
             st.error("❌ Numéro d'article obligatoire.")
+            st.stop()
+
+        # Si l'article existe mais que designation vide, on tente de la récupérer
+        if not designation:
+            designation_db = get_designation(article)
+            if designation_db:
+                designation = designation_db
+                st.session_state["mvt_designation"] = designation
+
+        # ✅ Ici: tu ne veux pas d'erreur si designation vide
+        # Donc on accepte, et si tu veux, on met juste une valeur par défaut
+        if not designation:
+            designation = "(sans désignation)"
+
+        # 1) Crée / MAJ l'article si besoin
+        # (si tu as une fonction upsert_article existante)
+        if maj_seuil:
+            upsert_article(article, designation, garantie=0, seuil_piece=int(seuil_piece))
         else:
-            existing_design = get_article_designation(article)
+            # ne touche pas le seuil si tu ne veux pas le modifier
+            upsert_article(article, designation, garantie=0, seuil_piece=None)  # adapte si ta fonction ne gère pas None
 
-            # Si article existe, et designation vide -> on met celle de la DB
-            if existing_design and not designation:
-                designation = existing_design
-                st.session_state["mvt_designation"] = existing_design
+        # 2) Appliquer mouvement sur stock
+        apply_movement(article, designation, type_mvt, int(quantite))
 
-            # Si article inconnu ET designation vide -> erreur propre
-            if (not existing_design) and (not designation):
-                st.error("❌ Nouvel article : la désignation est obligatoire.")
-            else:
-                # Upsert + seuil
-                if maj_seuil:
-                    upsert_article(article, designation=designation, seuil_piece=int(seuil_piece))
-                else:
-                    upsert_article(article, designation=designation, seuil_piece=None)
+        # 3) Insert dans mouvements
+        insert_movement(
+            date_mvt=date_mvt,
+            article=article,
+            designation=designation,
+            type_mvt=type_mvt,
+            emplacement=emplacement,
+            quantite=int(quantite),
+            adresse=adresse,
+            commentaire=commentaire,
+        )
 
-                # Mouvement
-                try:
-                    apply_movement(article, type_mvt, int(quantite))
-                    insert_movement(
-                        date_mvt=date_mvt,
-                        article=article,
-                        designation=designation,
-                        type_mvt=type_mvt,
-                        emplacement=emplacement,
-                        quantite=int(quantite),
-                        adresse=adresse,
-                        commentaire=commentaire,
-                    )
-                    cache_bust()
-                    st.success("✅ Mouvement enregistré.")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
-
-    st.divider()
-
-    # Modifier un article
-    st.subheader("Modifier un article (désignation / seuil pièce / garantie)")
-
-    articles_df = read_df(
-        """
-        SELECT article,
-               COALESCE(designation,'') AS designation,
-               COALESCE(seuil_piece,0) AS seuil_piece,
-               COALESCE(garantie,0) AS garantie
-        FROM articles
-        ORDER BY article
-        """
-    )
-    articles_list = articles_df["article"].astype(str).tolist()
-
-    if not articles_list:
-        st.info("Aucun article à modifier.")
-    else:
-        colA, colB = st.columns([1.2, 1.8])
-        with colA:
-            art_sel = st.selectbox("Choisir l'article", articles_list, key="edit_article_sel")
-            row = articles_df[articles_df["article"].astype(str) == str(art_sel)].iloc[0]
-
-        with colB:
-            with st.form("form_edit_article"):
-                new_design = st.text_input("Désignation", value=str(row["designation"] or ""))
-                new_seuil = st.number_input(
-                    "Seuil pièce (0 = pas de seuil perso)",
-                    min_value=0,
-                    max_value=10000,
-                    value=int(row["seuil_piece"]),
-                    step=1,
-                )
-                new_gar = st.number_input(
-                    "Garantie (nombre)",
-                    min_value=0,
-                    max_value=10000,
-                    value=int(row["garantie"]),
-                    step=1,
-                )
-                save_edit = st.form_submit_button("💾 Enregistrer la modification", use_container_width=True)
-
-            if save_edit:
-                if not str(new_design or "").strip():
-                    st.error("❌ La désignation ne peut pas être vide.")
-                else:
-                    try:
-                        update_article_fields(
-                            article=str(art_sel),
-                            designation=str(new_design).strip(),
-                            seuil_piece=int(new_seuil),
-                            garantie=int(new_gar),
-                        )
-                        cache_bust()
-                        st.success("✅ Article modifié.")
-                        st.rerun()
-                    except Exception as e:
-                        st.exception(e)
+        cache_bust()
+        st.success("✅ Mouvement enregistré.")
+        st.rerun()
 
 # ============================================================
 # TAB 2 : STOCK ACTUEL
