@@ -11,8 +11,6 @@
 #   * pas de callback Streamlit dans st.form (plus d'erreur)
 # ------------------------------------------------------------
 
-from _future_ import annotations
-
 import os
 import datetime as dt
 from dataclasses import dataclass
